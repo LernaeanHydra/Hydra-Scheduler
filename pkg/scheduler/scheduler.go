@@ -19,7 +19,6 @@ package scheduler
 import (
 	"encoding/json"
 	"fmt"
-	"github.com/ghodss/yaml"
 	"io/ioutil"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/tools/clientcmd"
@@ -280,7 +279,22 @@ func (sched *Scheduler) Run() {
 		return
 	}
 
-	go CRD2Pod()
+
+	clientSet := NewClientSet("39.107.241.0:80", "./config")
+	fmt.Println("new client set successfully")
+
+	CRDList := GetCRDNames("", clientSet)
+	fmt.Println("get crd names successfully")
+
+
+
+	for _, name := range CRDList {
+		go func(n string){
+			CRD2Pod(n)
+		}(name)
+	}
+
+
 	go wait.Until(sched.scheduleOne, 0, sched.config.StopEverything)
 }
 
@@ -540,7 +554,7 @@ func (sched *Scheduler) scheduleOne() {
 	// This allows us to keep scheduling without waiting on binding to occur.
 	assumedPod := pod.DeepCopy()
 
-	config, err := clientcmd.BuildConfigFromFlags("39.107.241.0:80", "/tmp/config")
+	config, err := clientcmd.BuildConfigFromFlags("39.107.241.0:80", "./config")
 	clientset, err := kubernetes.NewForConfig(config)
 	if err != nil {
 		fmt.Println("New For Config Error")
@@ -549,9 +563,9 @@ func (sched *Scheduler) scheduleOne() {
 
 	// TODO: Custom Resource Definition
 
-	if pod.Labels["isCRD"] == "yes" {
+	if CRDName, ok := pod.Labels["crd-name"]; ok{
 		fmt.Println("Watch the CRD")
-		fmt.Println("the proxy info is ", pod.Labels["proxy"])
+
 		err := clientset.CoreV1().Pods("default").Delete(pod.Name, &metav1.DeleteOptions{})
 		if err != nil {
 			fmt.Println("Delete Error: %s", err)
@@ -560,7 +574,7 @@ func (sched *Scheduler) scheduleOne() {
 
 
 		client := &http.Client{}
-		url := "http://39.107.241.0/apis/app.example.com/v1alpha1/namespaces/default/myapps/" + pod.Name
+		url := "http://39.107.241.0/apis/app.example.com/v1alpha1/namespaces/default/" + CRDName + "/" + pod.Name
 		body := fmt.Sprintf(`{"spec":{"nodeName": "%s"}}`, suggestedHost)
 
 		request, err := http.NewRequest("PATCH", url, strings.NewReader(body))
@@ -879,13 +893,46 @@ func (sched *Scheduler) scheduleOne() {
 	//}()
 //}
 
+// Read from configmap (default name: "extra-schedule-kind") to get all the CRDs needed for scheduling
 
-func CRD2Pod() {
+func GetCRDNames(configMapName string, clientset *kubernetes.Clientset) (CRDNames []string){
+	if configMapName == "" {
+		configMapName = "custom-schedule-kind"
+	}
+	configMap, err := clientset.CoreV1().ConfigMaps("default").Get(configMapName, metav1.GetOptions{})
+	if err != nil {
+		fmt.Errorf("Get ConfigMap Error: %s", err)
+	}
+	for _, name := range configMap.Data {
+		CRDNames = append(CRDNames, name)
+	}
+	return
+}
+
+// address is master's url, config is the path of kube config.
+// Return a new ClientSet
+func NewClientSet(address, config string)(*kubernetes.Clientset){
+
+	conf, err := clientcmd.BuildConfigFromFlags(address, config)
+	if err != nil {
+		fmt.Errorf("Build Config Error: %s", err)
+	}
+
+	clientset, err := kubernetes.NewForConfig(conf)
+
+	if err != nil {
+		fmt.Errorf("NewForConfig Error: %s", err)
+	}
+	return clientset
+
+}
+
+func CRD2Pod(CRDName string) {
 
 	config, err := clientcmd.BuildConfigFromFlags("39.107.241.0:80", "./config")
 	clientset, err := kubernetes.NewForConfig(config)
 	if err != nil {
-		fmt.Println("New For Config Error")
+		fmt.Errorf("New For Config Error: %s", err)
 	}
 
 	//已经被调度过的app的名字
@@ -897,19 +944,39 @@ func CRD2Pod() {
 
 
 	for {
-		time.Sleep(1 * time.Second)
 
-		url := "http://39.107.241.0/apis/app.example.com/v1alpha1/namespaces/default/myapps"
+
+		url := "http://39.107.241.0/apis/app.example.com/v1alpha1/namespaces/default/" + CRDName
 		resp, err := http.Get(url)
 		if err != nil {
 			fmt.Println("Get Url Error")
 		}
 
 		body, err := ioutil.ReadAll(resp.Body)
+
 		err = json.Unmarshal(body, &currentPodList)
 		for _, pod := range currentPodList.Items {
 			if hasScheduled := hasScheduledPods[pod.Name]; !hasScheduled {
-				DealPod(&pod)
+
+				// Alter some configurations of this pod
+
+				pod.Kind = "Pod"
+				pod.Spec.Containers = append(pod.Spec.Containers, v1.Container{Name:"nginx", Image:"nginx"})
+				if pod.Labels == nil {
+					pod.Labels = make(map[string]string)
+				}
+
+				//yamlBytes, err := yaml.JSONToYAML(body)
+				//if err != nil {
+				//	fmt.Println("JSONToYAML Error", err)
+				//}
+				//
+				//pod.Labels["proxy"] = string(yamlBytes) + "aaa"
+
+				pod.Labels["crd-name"] = CRDName
+				pod.ResourceVersion = ""
+
+
 				createResult, err := clientset.CoreV1().Pods("default").Create(&pod)
 				fmt.Println("Create Pod Success:", createResult.Name)
 				if err != nil {
@@ -936,32 +1003,8 @@ func CRD2Pod() {
 		//	}
 		//	fmt.Println(aaa)
 		//}
+		time.Sleep(1 * time.Second)
 	}
 
 }
 
-func DealPod(pod *v1.Pod) {
-	url := "http://39.107.241.0/apis/app.example.com/v1alpha1/namespaces/default/myapps"
-	resp, err := http.Get(url + "/" + pod.Name)
-	body, err := ioutil.ReadAll(resp.Body)
-
-	if err != nil {
-		fmt.Println("DealPod Get Error:", err)
-	}
-
-	pod.Kind = "Pod"
-	pod.Spec.Containers = append(pod.Spec.Containers, v1.Container{Name:"nginx", Image:"nginx"})
-	if pod.Labels == nil {
-		pod.Labels = make(map[string]string)
-	}
-
-	//yamlBytes, err := yaml.JSONToYAML(body)
-	//if err != nil {
-	//	fmt.Println("JSONToYAML Error", err)
-	//}
-	//
-	//pod.Labels["proxy"] = string(yamlBytes) + "aaa"
-	pod.Labels["isCRD"] = "yes"
-	pod.ResourceVersion = ""
-
-}
