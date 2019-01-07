@@ -17,9 +17,14 @@ limitations under the License.
 package scheduler
 
 import (
+	"encoding/json"
 	"fmt"
 	"io/ioutil"
+	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/tools/clientcmd"
+	"net/http"
 	"os"
+	"strings"
 	"time"
 
 	"k8s.io/api/core/v1"
@@ -46,11 +51,6 @@ import (
 	"k8s.io/kubernetes/pkg/scheduler/util"
 
 	"github.com/golang/glog"
-	"k8s.io/kubernetes/schd/aladdin/cores"
-	"k8s.io/kubernetes/schd/aladdin/solvers"
-	//"github.com/onsi/gomega/matchers/support/goraph/edge"
-	//"encoding/asn1"
-	"strconv"
 )
 
 const (
@@ -279,7 +279,22 @@ func (sched *Scheduler) Run() {
 		return
 	}
 
-	      
+
+	clientSet := NewClientSet("39.107.241.0:80", "./config")
+	fmt.Println("new client set successfully")
+
+	CRDList := GetCRDNames("", clientSet)
+	fmt.Println("get crd names successfully")
+
+
+
+	for _, name := range CRDList {
+		go func(n string){
+			CRD2Pod(n)
+		}(name)
+	}
+
+
 	go wait.Until(sched.scheduleOne, 0, sched.config.StopEverything)
 }
 
@@ -539,6 +554,47 @@ func (sched *Scheduler) scheduleOne() {
 	// This allows us to keep scheduling without waiting on binding to occur.
 	assumedPod := pod.DeepCopy()
 
+	config, err := clientcmd.BuildConfigFromFlags("39.107.241.0:80", "./config")
+	clientset, err := kubernetes.NewForConfig(config)
+	if err != nil {
+		fmt.Println("New For Config Error")
+	}
+
+
+	// TODO: Custom Resource Definition
+
+	if CRDName, ok := pod.Labels["crd-name"]; ok{
+		fmt.Println("Watch the CRD")
+
+		err := clientset.CoreV1().Pods("default").Delete(pod.Name, &metav1.DeleteOptions{})
+		if err != nil {
+			fmt.Println("Delete Error: %s", err)
+		}
+		fmt.Println("Delete Success")
+
+
+		client := &http.Client{}
+		url := "http://39.107.241.0/apis/app.example.com/v1alpha1/namespaces/default/" + CRDName + "/" + pod.Name
+		body := fmt.Sprintf(`{"spec":{"nodeName": "%s"}}`, suggestedHost)
+
+		request, err := http.NewRequest("PATCH", url, strings.NewReader(body))
+		request.Header.Set("Accept", "application/json")
+		request.Header.Set("Content-Type", "application/merge-patch+json")
+		if err != nil {
+			panic(err)
+		}
+		response, _ := client.Do(request)
+		fmt.Println("Patch Response:", *response)
+
+		return
+
+	}
+
+
+
+
+
+
 	// Assume volumes first before assuming the pod.
 	//
 	// If all volumes are completely bound, then allBound is true and binding will be skipped.
@@ -590,156 +646,156 @@ func (sched *Scheduler) scheduleOne() {
 }
 
 // scheduleAll does the entire scheduling workflow using flow schedule framework for current all pods.
-func (sched *Scheduler) scheduleAll() {
-	fmt.Println("begin get next pod")
-	//pods := sched.config.NextPodsList()
-	//pods := make([]*v1.Pod,0)
-	pods := make(map[string]*v1.Pod)
-	for i:=0; i<2; i++{
-		pod := sched.config.NextPod()
-		pods[pod.Name] = pod
-	}
-	fmt.Println("begin get next pod successfully")
-	// pod could be nil when schedulerQueue is closed
-	if pods == nil {
-		return
-	}
-    //shift := 0
-	for _, pod := range pods {
-		if pod.DeletionTimestamp != nil {
-			sched.config.Recorder.Eventf(pod, v1.EventTypeWarning, "FailedScheduling", "skip schedule deleting pod: %v/%v", pod.Namespace, pod.Name)
-			glog.V(3).Infof("Skip schedule deleting pod: %v/%v", pod.Namespace, pod.Name)
-			//shift ++
-			delete(pods, pod.Name)
-		}
-		// todo
-		//glog.V(3).Infof("Attempting to schedule pod: %v/%v", pods[index-shift].Namespace, pods[index-shift].Name)
-	}
-
-	if len(pods) == 0 {
-		return
-	}
-
-	nodes, err := sched.config.NodeLister.List();
-	if err != nil {
-		glog.V(3).Infof("err happens when list availiable nodes : %v", err)
-		fmt.Printf("err happens when list availiable nodes : %v", err)
-	}
-	if len(nodes) == 0 {
-		glog.V(3).Infof("no availiable nodes for scheduling")
-		fmt.Printf("no availiable nodes for scheduling")
-		return
-	}
-
-    // construct graph with pods
-	graph := cores.NewGraph()
-	// todo add vertex and edge with pods
-	err = graph.InitGraphVertex(nodes, pods)
-	if err != nil {
-		return
-	}
-
-	source, _ := graph.GetVertex("source")
-	sink, _ := graph.GetVertex("sink")
-
-	solver := solvers.NewSMaxFlowSolver(graph, *source, *sink, solvers.NewDijkstra())
-
-	flow := solver.MaxFlow()
-	for _, path := range flow.GetPaths(){
-		element_front := path.GetEdges().Front()
-		edge_front := element_front.Value.(cores.Edge)
-		podName := edge_front.GetTo().GetName()
-		fmt.Println("_____________"+podName)
-		pod := pods[podName]
-		fmt.Println("--------------------"+strconv.FormatBool(pod == nil))
-		element_back := path.GetEdges().Back()
-		edge_back := element_back.Value.(cores.Edge)
-		suggestedHost := edge_back.GetFrom().GetName()
-
-
-
-		start := time.Now()
-		fmt.Println("begin scheduling pod successfully "+suggestedHost)
-		if err != nil {
-			// schedule() may have failed because the pod would not fit on any host, so we try to
-			// preempt, with the expectation that the next time the pod is tried for scheduling it
-			// will fit due to the preemption. It is also possible that a different pod will schedule
-			// into the resources that were preempted, but this is harmless.
-			if fitError, ok := err.(*core.FitError); ok {
-				preemptionStartTime := time.Now()
-				sched.preempt(pod, fitError)
-				metrics.PreemptionAttempts.Inc()
-				metrics.SchedulingAlgorithmPremptionEvaluationDuration.Observe(metrics.SinceInMicroseconds(preemptionStartTime))
-				metrics.SchedulingLatency.WithLabelValues(metrics.PreemptionEvaluation).Observe(metrics.SinceInSeconds(preemptionStartTime))
-				// Pod did not fit anywhere, so it is counted as a failure. If preemption
-				// succeeds, the pod should get counted as a success the next time we try to
-				// schedule it. (hopefully)
-				metrics.PodScheduleFailures.Inc()
-			} else {
-				glog.Errorf("error selecting node for pod: %v", err)
-				metrics.PodScheduleErrors.Inc()
-			}
-			return
-		}
-		metrics.SchedulingAlgorithmLatency.Observe(metrics.SinceInMicroseconds(start))
-		// Tell the cache to assume that a pod now is running on a given node, even though it hasn't been bound yet.
-		// This allows us to keep scheduling without waiting on binding to occur.
-		assumedPod := pod.DeepCopy()
-
-		// Assume volumes first before assuming the pod.
-		//
-		// If all volumes are completely bound, then allBound is true and binding will be skipped.
-		//
-		// Otherwise, binding of volumes is started after the pod is assumed, but before pod binding.
-		//
-		// This function modifies 'assumedPod' if volume binding is required.
-
-		//allBound, err := sched.assumeVolumes(assumedPod, suggestedHost)
-		//if err != nil {
-		//	glog.Errorf("error assuming volumes: %v", err)
-		//	metrics.PodScheduleErrors.Inc()
-		//	return
-		//}
-
-		// assume modifies `assumedPod` by setting NodeName=suggestedHost
-		//err = sched.assume(assumedPod, suggestedHost)
-		//if err != nil {
-		//	glog.Errorf("error assuming pod: %v", err)
-		//	metrics.PodScheduleErrors.Inc()
-		//	return
-		//}
-		// bind the pod to its host asynchronously (we can do this b/c of the assumption step above).
-		go func() {
-			// Bind volumes first before Pod
-			//if !allBound {
-			//	err := sched.bindVolumes(assumedPod)
-			//	if err != nil {
-			//		glog.Errorf("error binding volumes: %v", err)
-			//		metrics.PodScheduleErrors.Inc()
-			//		return
-			//	}
-			//}
-			//fmt.Println("--------------------"+strconv.FormatBool(pod == nil))
-			fmt.Println(assumedPod.Name+" "+assumedPod.Namespace )
-			err := sched.bind(pod, &v1.Binding{
-				ObjectMeta: metav1.ObjectMeta{Namespace: assumedPod.Namespace, Name: assumedPod.Name, UID: assumedPod.UID},
-				Target: v1.ObjectReference{
-					Kind: "Node",
-					Name: suggestedHost,
-				},
-			})
-			metrics.E2eSchedulingLatency.Observe(metrics.SinceInMicroseconds(start))
-			if err != nil {
-				glog.Errorf("error binding pod: %v", err)
-				metrics.PodScheduleErrors.Inc()
-			} else {
-				metrics.PodScheduleSuccesses.Inc()
-			}
-		}()
-
-
-
-	}
+//func (sched *Scheduler) scheduleAll() {
+//	fmt.Println("begin get next pod")
+//	//pods := sched.config.NextPodsList()
+//	//pods := make([]*v1.Pod,0)
+//	pods := make(map[string]*v1.Pod)
+//	for i:=0; i<2; i++{
+//		pod := sched.config.NextPod()
+//		pods[pod.Name] = pod
+//	}
+//	fmt.Println("begin get next pod successfully")
+//	// pod could be nil when schedulerQueue is closed
+//	if pods == nil {
+//		return
+//	}
+//    //shift := 0
+//	for _, pod := range pods {
+//		if pod.DeletionTimestamp != nil {
+//			sched.config.Recorder.Eventf(pod, v1.EventTypeWarning, "FailedScheduling", "skip schedule deleting pod: %v/%v", pod.Namespace, pod.Name)
+//			glog.V(3).Infof("Skip schedule deleting pod: %v/%v", pod.Namespace, pod.Name)
+//			//shift ++
+//			delete(pods, pod.Name)
+//		}
+//		// todo
+//		//glog.V(3).Infof("Attempting to schedule pod: %v/%v", pods[index-shift].Namespace, pods[index-shift].Name)
+//	}
+//
+//	if len(pods) == 0 {
+//		return
+//	}
+//
+//	nodes, err := sched.config.NodeLister.List();
+//	if err != nil {
+//		glog.V(3).Infof("err happens when list availiable nodes : %v", err)
+//		fmt.Printf("err happens when list availiable nodes : %v", err)
+//	}
+//	if len(nodes) == 0 {
+//		glog.V(3).Infof("no availiable nodes for scheduling")
+//		fmt.Printf("no availiable nodes for scheduling")
+//		return
+//	}
+//
+//    // construct graph with pods
+//	graph := cores.NewGraph()
+//	// todo add vertex and edge with pods
+//	err = graph.InitGraphVertex(nodes, pods)
+//	if err != nil {
+//		return
+//	}
+//
+//	source, _ := graph.GetVertex("source")
+//	sink, _ := graph.GetVertex("sink")
+//
+//	solver := solvers.NewSMaxFlowSolver(graph, *source, *sink, solvers.NewDijkstra())
+//
+//	flow := solver.MaxFlow()
+//	for _, path := range flow.GetPaths(){
+//		element_front := path.GetEdges().Front()
+//		edge_front := element_front.Value.(cores.Edge)
+//		podName := edge_front.GetTo().GetName()
+//		fmt.Println("_____________"+podName)
+//		pod := pods[podName]
+//		fmt.Println("--------------------"+strconv.FormatBool(pod == nil))
+//		element_back := path.GetEdges().Back()
+//		edge_back := element_back.Value.(cores.Edge)
+//		suggestedHost := edge_back.GetFrom().GetName()
+//
+//
+//
+//		start := time.Now()
+//		fmt.Println("begin scheduling pod successfully "+suggestedHost)
+//		if err != nil {
+//			// schedule() may have failed because the pod would not fit on any host, so we try to
+//			// preempt, with the expectation that the next time the pod is tried for scheduling it
+//			// will fit due to the preemption. It is also possible that a different pod will schedule
+//			// into the resources that were preempted, but this is harmless.
+//			if fitError, ok := err.(*core.FitError); ok {
+//				preemptionStartTime := time.Now()
+//				sched.preempt(pod, fitError)
+//				metrics.PreemptionAttempts.Inc()
+//				metrics.SchedulingAlgorithmPremptionEvaluationDuration.Observe(metrics.SinceInMicroseconds(preemptionStartTime))
+//				metrics.SchedulingLatency.WithLabelValues(metrics.PreemptionEvaluation).Observe(metrics.SinceInSeconds(preemptionStartTime))
+//				// Pod did not fit anywhere, so it is counted as a failure. If preemption
+//				// succeeds, the pod should get counted as a success the next time we try to
+//				// schedule it. (hopefully)
+//				metrics.PodScheduleFailures.Inc()
+//			} else {
+//				glog.Errorf("error selecting node for pod: %v", err)
+//				metrics.PodScheduleErrors.Inc()
+//			}
+//			return
+//		}
+//		metrics.SchedulingAlgorithmLatency.Observe(metrics.SinceInMicroseconds(start))
+//		// Tell the cache to assume that a pod now is running on a given node, even though it hasn't been bound yet.
+//		// This allows us to keep scheduling without waiting on binding to occur.
+//		assumedPod := pod.DeepCopy()
+//
+//		// Assume volumes first before assuming the pod.
+//		//
+//		// If all volumes are completely bound, then allBound is true and binding will be skipped.
+//		//
+//		// Otherwise, binding of volumes is started after the pod is assumed, but before pod binding.
+//		//
+//		// This function modifies 'assumedPod' if volume binding is required.
+//
+//		//allBound, err := sched.assumeVolumes(assumedPod, suggestedHost)
+//		//if err != nil {
+//		//	glog.Errorf("error assuming volumes: %v", err)
+//		//	metrics.PodScheduleErrors.Inc()
+//		//	return
+//		//}
+//
+//		// assume modifies `assumedPod` by setting NodeName=suggestedHost
+//		//err = sched.assume(assumedPod, suggestedHost)
+//		//if err != nil {
+//		//	glog.Errorf("error assuming pod: %v", err)
+//		//	metrics.PodScheduleErrors.Inc()
+//		//	return
+//		//}
+//		// bind the pod to its host asynchronously (we can do this b/c of the assumption step above).
+//		go func() {
+//			// Bind volumes first before Pod
+//			//if !allBound {
+//			//	err := sched.bindVolumes(assumedPod)
+//			//	if err != nil {
+//			//		glog.Errorf("error binding volumes: %v", err)
+//			//		metrics.PodScheduleErrors.Inc()
+//			//		return
+//			//	}
+//			//}
+//			//fmt.Println("--------------------"+strconv.FormatBool(pod == nil))
+//			fmt.Println(assumedPod.Name+" "+assumedPod.Namespace )
+//			err := sched.bind(pod, &v1.Binding{
+//				ObjectMeta: metav1.ObjectMeta{Namespace: assumedPod.Namespace, Name: assumedPod.Name, UID: assumedPod.UID},
+//				Target: v1.ObjectReference{
+//					Kind: "Node",
+//					Name: suggestedHost,
+//				},
+//			})
+//			metrics.E2eSchedulingLatency.Observe(metrics.SinceInMicroseconds(start))
+//			if err != nil {
+//				glog.Errorf("error binding pod: %v", err)
+//				metrics.PodScheduleErrors.Inc()
+//			} else {
+//				metrics.PodScheduleSuccesses.Inc()
+//			}
+//		}()
+//
+//
+//
+//	}
 
 
 
@@ -835,4 +891,120 @@ func (sched *Scheduler) scheduleAll() {
 	//		metrics.PodScheduleSuccesses.Inc()
 	//	}
 	//}()
+//}
+
+// Read from configmap (default name: "extra-schedule-kind") to get all the CRDs needed for scheduling
+
+func GetCRDNames(configMapName string, clientset *kubernetes.Clientset) (CRDNames []string){
+	if configMapName == "" {
+		configMapName = "custom-schedule-kind"
+	}
+	configMap, err := clientset.CoreV1().ConfigMaps("default").Get(configMapName, metav1.GetOptions{})
+	if err != nil {
+		fmt.Errorf("Get ConfigMap Error: %s", err)
+	}
+	for _, name := range configMap.Data {
+		CRDNames = append(CRDNames, name)
+	}
+	return
 }
+
+// address is master's url, config is the path of kube config.
+// Return a new ClientSet
+func NewClientSet(address, config string)(*kubernetes.Clientset){
+
+	conf, err := clientcmd.BuildConfigFromFlags(address, config)
+	if err != nil {
+		fmt.Errorf("Build Config Error: %s", err)
+	}
+
+	clientset, err := kubernetes.NewForConfig(conf)
+
+	if err != nil {
+		fmt.Errorf("NewForConfig Error: %s", err)
+	}
+	return clientset
+
+}
+
+func CRD2Pod(CRDName string) {
+
+	config, err := clientcmd.BuildConfigFromFlags("39.107.241.0:80", "./config")
+	clientset, err := kubernetes.NewForConfig(config)
+	if err != nil {
+		fmt.Errorf("New For Config Error: %s", err)
+	}
+
+	//已经被调度过的app的名字
+	hasScheduledPods := make(map[string]bool)
+
+	//还未被调度过的app
+	// needSched := make([]string, 0)
+	var currentPodList v1.PodList
+
+
+	for {
+
+
+		url := "http://39.107.241.0/apis/app.example.com/v1alpha1/namespaces/default/" + CRDName
+		resp, err := http.Get(url)
+		if err != nil {
+			fmt.Println("Get Url Error")
+		}
+
+		body, err := ioutil.ReadAll(resp.Body)
+
+		err = json.Unmarshal(body, &currentPodList)
+		for _, pod := range currentPodList.Items {
+			if hasScheduled := hasScheduledPods[pod.Name]; !hasScheduled {
+
+				// Alter some configurations of this pod
+
+				pod.Kind = "Pod"
+				pod.Spec.Containers = append(pod.Spec.Containers, v1.Container{Name:"nginx", Image:"nginx"})
+				if pod.Labels == nil {
+					pod.Labels = make(map[string]string)
+				}
+
+				//yamlBytes, err := yaml.JSONToYAML(body)
+				//if err != nil {
+				//	fmt.Println("JSONToYAML Error", err)
+				//}
+				//
+				//pod.Labels["proxy"] = string(yamlBytes) + "aaa"
+
+				pod.Labels["crd-name"] = CRDName
+				pod.ResourceVersion = ""
+
+
+				createResult, err := clientset.CoreV1().Pods("default").Create(&pod)
+				fmt.Println("Create Pod Success:", createResult.Name)
+				if err != nil {
+					fmt.Println("Create Pod Error: ", err)
+				}
+				hasScheduledPods[pod.Name] = true
+			}
+		}
+
+
+		//for _, pod := range podList.Items {
+		//
+		//	pod.Kind = "Pod"
+		//	pod.Spec.Containers = append(pod.Spec.Containers, v1.Container{Name: "nginx", Image: "nginx"})
+		//	if pod.Labels == nil {
+		//		pod.Labels = make(map[string]string)
+		//		pod.Labels["isCRD"] = "yes"
+		//	}
+		//
+		//	pod.ResourceVersion = ""
+		//	aaa, err := clientset.CoreV1().Pods(types.NamespaceDefault).Create(&pod)
+		//	if err != nil {
+		//		fmt.Println("Create Error:  ", err)
+		//	}
+		//	fmt.Println(aaa)
+		//}
+		time.Sleep(1 * time.Second)
+	}
+
+}
+
