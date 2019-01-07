@@ -6,9 +6,10 @@ Kubernetes Scheduler 会通过 kube-apiserver 来获得新创建的 Pod，并通
 自定义资源（CRD）是对 Kubernetes API 的扩展，每种资源都是存储特定类型 API 对象的集合。
 
 由于 Pod 才是 Kubernetes Scheduler 默认的调度单元，我们想要对 CRD 进行调度，必须先将 CRD “转换”成一个 Pod。这个 Pod 需要做上标记，经由 Kubernetes Scheduler 调度，在调度过程中，只获得最适合这个 Pod 调度的节点的名称，不进行实际的调度过程，最后将 CRD 放置到这个节点上去运行。整体流程如下：
+
 ![](./pic/1.png)
 
-### 自定义资源类型
+### 示例
 我们首先通过 CustomResourceDefinition（CRD） 来实现两种新的资源类型，名称分别为 MyApp 和 NCApp，NCApp 对应的 myapp-crd.yaml 文件如下，MyApp 对应的 YAML 文件与之类似。
 ```yaml
 apiVersion: apiextensions.k8s.io/v1beta1
@@ -39,7 +40,7 @@ data:
 ```
 ConfigMap 的 data 中保存了需要监听并调度的 CRD 资源类型的名字，在这里我们使用了名字的复数形式，更加便于实现。
 
-这时，我们就可以创建一个类型为 NCApp 的对象，对象名称为 test-ncapp1，对应的 test-npapp1.yaml 文件如下：
+这时运行本程序。我们创建一个类型为 NCApp 的对象，对象名称为 test-ncapp1，对应的 test-npapp1.yaml 文件如下：
 ```
 apiVersion: app.example.com/v1alpha1
 kind: NCApp
@@ -63,7 +64,7 @@ Spec:
   Node Name:  iz2ze86eplnjdkjfil6oahz
   ...
 ```
-可以看到 Spec.nodeName 字段已经变为 iz2ze86eplnjdkjfil6oahz，即调度节点的名字。然后就可以将 test-npapp1 放置到这个节点上面运行。
+可以看到 Spec.nodeName 字段已经变为 iz2ze86eplnjdkjfil6oahz，即调度节点的名字。然后就可以将 test-npapp1 放置到这个节点上面运行，这部分的工作由师兄完成。
 
 ### CRD Scheduler 实现
 #### 获取 CRD 资源类型的对象
